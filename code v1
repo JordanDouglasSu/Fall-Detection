@@ -1,13 +1,18 @@
+#include <Arduino.h>
+
+#define RXD2 16
+#define TXD2 17
+
 // ---------- Tunable thresholds (speeds in cm/s) ----------
-#define SPEED_PEAK_CMS      45    // min speed to count as a fall burst (was 100)
-#define SPEED_JUMP_CMS      25    // rise vs. slowest of last 3 frames (was 70)
+#define SPEED_PEAK_CMS      45    // min speed to count as a fall burst
+#define SPEED_JUMP_CMS      25    // rise vs. slowest of last 3 frames
 #define SPEED_HIGH_CMS     100    // very fast movement triggers on its own
-#define STILL_SPEED_CMS     10    // below this = not moving (was 5)
-#define MOVE_SPEED_CMS      35    // above this = person is up and moving (was 20)
+#define STILL_SPEED_CMS     10    // below this = not moving
+#define MOVE_SPEED_CMS      35    // above this = person is up and moving
 #define SETTLE_MS          400    // ignore data right after the burst
-#define STILL_TIME_MS     2000    // must stay still/missing this long (was 3000)
+#define STILL_TIME_MS     2000    // must stay still/missing this long
 #define SUSPECT_TIMEOUT_MS 12000  // give up if not confirmed in this time
-#define TRACK_RADIUS_MM    2000   // how far the person may move (was 1500)
+#define TRACK_RADIUS_MM    2000   // how far the person may move
 #define COOLDOWN_MS        8000
 
 struct Target { int x, y, v; bool active; };
@@ -18,14 +23,12 @@ State state = MONITOR;
 int hist[3][3] = {{0}};             // last 3 speeds per target
 unsigned long suspectStart = 0, stillSince = 0, cooldownStart = 0;
 int fx = 0, fy = 0;
-
-unsigned long lastPrint = 0;
 uint32_t packetCount = 0;
 
-int16_t decode(uint8_t lo, uint8_t hi) {
+int decodeVal(uint8_t lo, uint8_t hi) {
   uint16_t raw = lo | (hi << 8);
-  int16_t mag = raw & 0x7FFF;
-  return (raw & 0x8000) ? mag : -mag;
+  int mag = raw & 0x7FFF;
+  return (raw & 0x8000) ? mag : -mag;   // bit15 = 1 -> positive
 }
 
 void processFrame(Target t[3]) {
@@ -37,7 +40,9 @@ void processFrame(Target t[3]) {
       for (int i = 0; i < 3; i++) {
         if (!t[i].active) continue;
         int absV = abs(t[i].v);
-        int minRecent = min(hist[i][0], min(hist[i][1], hist[i][2]));
+        int minRecent = hist[i][0];
+        if (hist[i][1] < minRecent) minRecent = hist[i][1];
+        if (hist[i][2] < minRecent) minRecent = hist[i][2];
         int jump = absV - minRecent;
         bool burst = (absV >= SPEED_PEAK_CMS && jump >= SPEED_JUMP_CMS) ||
                      (absV >= SPEED_HIGH_CMS);
@@ -62,7 +67,6 @@ void processFrame(Target t[3]) {
       }
       if (now - suspectStart < SETTLE_MS) break;
 
-      // Find the active target closest to the last known position
       int best = -1;
       long bestDist = (long)TRACK_RADIUS_MM * TRACK_RADIUS_MM;
       for (int i = 0; i < 3; i++) {
@@ -79,7 +83,7 @@ void processFrame(Target t[3]) {
         fx = t[best].x;
         fy = t[best].y;
         int absV = abs(t[best].v);
-        if (absV >= MOVE_SPEED_CMS) {    // clearly moving again: not a fall
+        if (absV >= MOVE_SPEED_CMS) {
           Serial.println(">> Cancelled: person moving normally");
           state = MONITOR;
           break;
@@ -97,7 +101,7 @@ void processFrame(Target t[3]) {
           cooldownStart = now;
         }
       } else {
-        stillSince = 0;                  // small movement, restart the timer
+        stillSince = 0;
       }
       break;
     }
@@ -110,10 +114,54 @@ void processFrame(Target t[3]) {
       break;
   }
 
-  // Shift speed history (keeps last 3 frames per target)
   for (int i = 0; i < 3; i++) {
     hist[i][2] = hist[i][1];
     hist[i][1] = hist[i][0];
     hist[i][0] = t[i].active ? abs(t[i].v) : 0;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(256000, SERIAL_8N1, RXD2, TXD2);
+  Serial.println("\n--- LD2450 Fall Detection started ---");
+}
+
+void loop() {
+  static uint8_t buf[30];
+  static int idx = 0;
+
+  while (Serial2.available()) {
+    uint8_t b = Serial2.read();
+
+    if (idx == 0) { if (b == 0xAA) buf[idx++] = b; continue; }
+    if (idx == 1) { if (b == 0xFF) buf[idx++] = b; else idx = (b == 0xAA) ? 1 : 0; continue; }
+
+    buf[idx++] = b;
+
+    if (idx == 30) {
+      if (buf[28] == 0x55 && buf[29] == 0xCC) {
+        packetCount++;
+
+        Target t[3];
+        for (int i = 0; i < 3; i++) {
+          int o = 4 + i * 8;
+          t[i].x = decodeVal(buf[o],     buf[o + 1]);
+          t[i].y = decodeVal(buf[o + 2], buf[o + 3]);
+          t[i].v = decodeVal(buf[o + 4], buf[o + 5]);
+          t[i].active = !(t[i].x == 0 && t[i].y == 0);
+        }
+
+        processFrame(t);
+
+        // Radar data line: D,x1,y1,v1,x2,y2,v2,x3,y3,v3,state
+        Serial.printf("D,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+          t[0].x, t[0].y, t[0].v,
+          t[1].x, t[1].y, t[1].v,
+          t[2].x, t[2].y, t[2].v,
+          (int)state);
+      }
+      idx = 0;
+    }
   }
 }
