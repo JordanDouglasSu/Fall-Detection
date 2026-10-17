@@ -2,7 +2,7 @@
 IDP Project Fall Detection
 
 use this video for LD2450: https://www.youtube.com/watch?v=r4xcSuhZol0
-<br> Note: This uses Rasberry Pi
+<br> Note: The above video uses Rasberry Pi
 
 
 pdf file of how the sensor work: https://www.tinytronics.nl/product_files/006000_HLK-LD2450-Instruction-Manual.pdf
