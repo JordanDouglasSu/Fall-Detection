@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HLK-LD2450 Fall Detection Radar</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --panel: #111827;
+      --border: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --cyan: #06b6d4;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      display: grid;
+      grid-template-columns: 1fr 380px;
+      height: 100vh;
+      overflow: hidden;
+    }
+    .radar-pane {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      position: relative;
+    }
+    canvas {
+      background: radial-gradient(circle at 50% 6%, #132238 0%, #090d16 75%);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+      max-width: 100%;
+      max-height: calc(100vh - 32px);
+    }
+    .sidebar {
+      background: var(--panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      gap: 14px;
+      overflow-y: auto;
+    }
+    h1 {
+      font-size: 1.05rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--cyan);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .btn {
+      background: var(--cyan);
+      color: #000;
+      border: none;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-weight: 700;
+      font-family: inherit;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.9; }
+    .btn.connected { background: var(--red); color: #fff; }
+
+    .state-banner {
+      padding: 14px;
+      border-radius: 8px;
+      text-align: center;
+      font-weight: 800;
+      font-size: 1.2rem;
+      letter-spacing: 0.08em;
+      border: 1px solid var(--border);
+      transition: all 0.2s;
+    }
+    .state-0 { background: rgba(16, 185, 129, 0.12); color: var(--green); border-color: var(--green); }
+    .state-1 { background: rgba(245, 158, 11, 0.15); color: var(--amber); border-color: var(--amber); }
+    .state-2 { background: rgba(239, 68, 68, 0.22); color: var(--red); border-color: var(--red); animation: pulse 1s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.02); box-shadow: 0 0 20px rgba(239, 68, 68, 0.45); }
+    }
+
+    .card {
+      background: rgba(17, 24, 39, 0.7);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .card-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 8px;
+      letter-spacing: 0.05em;
+    }
+    .target-row {
+      display: grid;
+      grid-template-columns: 32px 1fr 1fr 1fr;
+      font-size: 0.85rem;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      align-items: center;
+    }
+    .target-row:last-child { border-bottom: none; }
+    .badge {
+      display: inline-block;
+      width: 22px;
+      height: 22px;
+      line-height: 22px;
+      text-align: center;
+      border-radius: 50%;
+      font-weight: 700;
+      font-size: 0.75rem;
+      color: #000;
+    }
+    .legend {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .legend span { display: flex; align-items: center; gap: 6px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+
+    .log-box {
+      flex: 1;
+      background: #05080f;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 0.78rem;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      line-height: 1.45;
+      color: #d1d5db;
+    }
+    .log-warn { color: var(--amber); }
+    .log-alert { color: var(--red); font-weight: bold; }
+    .log-info { color: var(--cyan); }
+  </style>
+</head>
+<body>
+
+  <div class="radar-pane">
+    <canvas id="radar" width="760" height="680"></canvas>
+  </div>
+
+  <div class="sidebar">
+    <h1>
+      <span>LD2450 Radar</span>
+      <span id="fps" style="font-size:0.75rem;color:var(--muted);">0 Hz</span>
+    </h1>
+
+    <button id="connectBtn" class="btn">Connect Serial (115200)</button>
+
+    <div id="stateBanner" class="state-banner state-0">STATE: MONITOR</div>
+
+    <div class="card">
+      <div class="card-title">Live Targets (mm | cm/s)</div>
+      <div class="target-row">
+        <span class="badge" style="background:#38bdf8">T1</span>
+        <span id="t0x">X: --</span>
+        <span id="t0y">Y: --</span>
+        <span id="t0v">V: --</span>
+      </div>
+      <div class="target-row">
+        <span class="badge" style="background:#a855f7">T2</span>
+        <span id="t1x">X: --</span>
+        <span id="t1y">Y: --</span>
+        <span id="t1v">V: --</span>
+      </div>
+      <div class="target-row">
+        <span class="badge" style="background:#f97316">T3</span>
+        <span id="t2x">X: --</span>
+        <span id="t2y">Y: --</span>
+        <span id="t2v">V: --</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Fall / Impact Anchor</div>
+      <div id="impactInfo" style="font-size:0.83rem; color:var(--muted);">
+        No active suspect/impact point
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Zone Legend</div>
+      <div class="legend">
+        <span><i class="dot" style="background:#f59e0b"></i>Floor Zone (500mm)</span>
+        <span><i class="dot" style="background:#10b981"></i>Recovery (800mm)</span>
+        <span><i class="dot" style="background:#ef4444"></i>Edge FOV (±55° / 5m)</span>
+        <span><i class="dot" style="background:#6366f1"></i>Track Step (600mm)</span>
+      </div>
+    </div>
+
+    <div class="card-title" style="margin-bottom:-8px;">ESP32 Event Log</div>
+    <div id="logBox" class="log-box"></div>
+  </div>
+
+<script>
+const MAX_RANGE_MM = 6000;
+const EDGE_Y_MM = 5000;
+const FLOOR_RADIUS_MM = 500;
+const RECOVERY_DIST_MM = 800;
+const MAX_STEP_MM = 600;
+
+const TARGET_COLORS = ['#38bdf8', '#a855f7', '#f97316'];
+const STATE_NAMES = ['MONITOR', 'SUSPECT (CHECKING)', 'FALL ALERT / COOLDOWN'];
+
+let port = null;
+let reader = null;
+let keepReading = false;
+
+let targets = [
+  { x: 0, y: 0, v: 0, active: false, trail: [] },
+  { x: 0, y: 0, v: 0, active: false, trail: [] },
+  { x: 0, y: 0, v: 0, active: false, trail: [] }
+];
+
+let currentState = 0;
+let impactPoint = null;   // { x, y } locked after SETTLE_MS
+let fallPoint = null;     // { x, y } confirmed fall coordinates
+let suspectTrack = null;  // { x, y } live tracked suspect position
+
+let frameCounter = 0;
+let lastFpsTime = performance.now();
+
+const canvas = document.getElementById('radar');
+const ctx = canvas.getContext('2d');
+const connectBtn = document.getElementById('connectBtn');
+const stateBanner = document.getElementById('stateBanner');
+const logBox = document.getElementById('logBox');
+const impactInfo = document.getElementById('impactInfo');
+
+function appendLog(msg, cls = '') {
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  const ts = new Date().toLocaleTimeString();
+  div.textContent = `[${ts}] ${msg}`;
+  logBox.appendChild(div);
+  while (logBox.childNodes.length > 150) {
+    logBox.removeChild(logBox.firstChild);
+  }
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+// Convert radar coordinates (mm) to Canvas pixels
+// Sensor is at top-center (originX, originY); Y increases downward, X is left(-) / right(+)
+function mmToCanvas(xMm, yMm) {
+  const originX = canvas.width / 2;
+  const originY = 40;
+  const scale = (canvas.height - 70) / MAX_RANGE_MM;
+  return {
+    px: originX + xMm * scale,
+    py: originY + yMm * scale,
+    scale
+  };
+}
+
+function parseSerialLine(line) {
+  line = line.trim();
+  if (!line) return;
+
+  // 1. Parse Telemetry Data Frame: D,x1,y1,v1,x2,y2,v2,x3,y3,v3,state
+  if (line.startsWith('D,')) {
+    const parts = line.split(',');
+    if (parts.length >= 11) {
+      for (let i = 0; i < 3; i++) {
+        const x = parseInt(parts[1 + i * 3], 10) || 0;
+        const y = parseInt(parts[2 + i * 3], 10) || 0;
+        const v = parseInt(parts[3 + i * 3], 10) || 0;
+        const active = !(x === 0 && y === 0);
+
+        targets[i].x = x;
+        targets[i].y = y;
+        targets[i].v = v;
+        targets[i].active = active;
+
+        if (active) {
+          targets[i].trail.push({ x, y, t: performance.now() });
+          if (targets[i].trail.length > 25) targets[i].trail.shift();
+        } else {
+          targets[i].trail = [];
+        }
+
+        document.getElementById(`t${i}x`).textContent = active ? `X:${x}` : 'X: --';
+        document.getElementById(`t${i}y`).textContent = active ? `Y:${y}` : 'Y: --';
+        document.getElementById(`t${i}v`).textContent = active ? `V:${v}` : 'V: --';
+      }
+
+      const newState = parseInt(parts[10], 10) || 0;
+      if (newState !== currentState) {
+        currentState = newState;
+        updateStateUI();
+      }
+
+      // Update live suspect tracker if in SUSPECT
+      if (currentState === 1) {
+        updateSuspectTracker();
+      } else if (currentState === 0) {
+        impactPoint = null;
+        fallPoint = null;
+        suspectTrack = null;
+        impactInfo.textContent = 'No active suspect/impact point';
+      }
+
+      frameCounter++;
+    }
+    return;
+  }
+
+  // 2. Parse Event Logs from ESP32
+  if (line.includes('Impact anchored at')) {
+    const m = line.match(/X:(-?\d+)\s+Y:(-?\d+)/);
+    if (m) {
+      impactPoint = { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
+      suspectTrack = { ...impactPoint };
+      impactInfo.innerHTML = `<span style="color:var(--amber)">Impact Locked:</span> X:${impactPoint.x} Y:${impactPoint.y} mm`;
+    }
+    appendLog(line, 'log-warn');
+  } else if (line.includes('FALL DETECTED!')) {
+    const m = line.match(/X:(-?\d+)\s+Y:(-?\d+)/);
+    if (m) {
+      fallPoint = { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
+      impactInfo.innerHTML = `<span style="color:var(--red);font-weight:bold;">FALL CONFIRMED:</span> X:${fallPoint.x} Y:${fallPoint.y} mm`;
+    }
+    appendLog(line, 'log-alert');
+  } else if (line.startsWith('>>')) {
+    appendLog(line, 'log-info');
+  } else {
+    appendLog(line);
+  }
+}
+
+function updateSuspectTracker() {
+  // Mirror ESP32 closest-target logic for visual feedback
+  const ref = suspectTrack || impactPoint;
+  if (!ref) {
+    const firstActive = targets.find(t => t.active);
+    if (firstActive) suspectTrack = { x: firstActive.x, y: firstActive.y };
+    return;
+  }
+  let bestDist = MAX_STEP_MM * MAX_STEP_MM;
+  let bestT = null;
+  for (const t of targets) {
+    if (!t.active) continue;
+    const dx = t.x - ref.x;
+    const dy = t.y - ref.y;
+    const dSq = dx * dx + dy * dy;
+    if (dSq <= bestDist) {
+      bestDist = dSq;
+      bestT = t;
+    }
+  }
+  if (bestT) {
+    suspectTrack = { x: bestT.x, y: bestT.y };
+  }
+}
+
+function updateStateUI() {
+  stateBanner.className = `state-banner state-${currentState}`;
+  stateBanner.textContent = `STATE: ${STATE_NAMES[currentState] || currentState}`;
+}
+
+function drawRadar() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const { px: ox, py: oy, scale } = mmToCanvas(0, 0);
+
+  // 1. Draw Range Arcs (every 1000mm up to 6000mm)
+  ctx.lineWidth = 1;
+  for (let r = 1000; r <= MAX_RANGE_MM; r += 1000) {
+    ctx.beginPath();
+    ctx.strokeStyle = r === EDGE_Y_MM ? 'rgba(239, 68, 68, 0.45)' : 'rgba(255, 255, 255, 0.1)';
+    if (r === EDGE_Y_MM) ctx.setLineDash([6, 6]);
+    else ctx.setLineDash([]);
+    ctx.arc(ox, oy, r * scale, 0, Math.PI);
+    ctx.stroke();
+
+    ctx.fillStyle = r === EDGE_Y_MM ? '#ef4444' : 'rgba(255,255,255,0.35)';
+    ctx.font = '11px monospace';
+    ctx.fillText(`${r / 1000}m`, ox + 6, oy + r * scale - 4);
+  }
+  ctx.setLineDash([]);
+
+  // 2. Draw Angle Guidelines & nearEdge() ±55° boundary (abs(x) = 1.4 * y)
+  const edgeAngle = Math.atan(1.4); // ~54.46 deg from Y axis
+  const angles = [-60, -30, 0, 30, 60];
+  angles.forEach(deg => {
+    const rad = (deg * Math.PI) / 180;
+    const ex = ox + Math.sin(rad) * (MAX_RANGE_MM * scale);
+    const ey = oy + Math.cos(rad) * (MAX_RANGE_MM * scale);
+    ctx.beginPath();
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+  });
+
+  // nearEdge() ±55 deg red dashed boundary lines
+  [-edgeAngle, edgeAngle].forEach(rad => {
+    const ex = ox + Math.sin(rad) * (MAX_RANGE_MM * scale);
+    const ey = oy + Math.cos(rad) * (MAX_RANGE_MM * scale);
+    ctx.beginPath();
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.45)';
+    ctx.moveTo(ox, oy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+  });
+  ctx.setLineDash([]);
+
+  // Draw Sensor Node at Origin
+  ctx.fillStyle = '#06b6d4';
+  ctx.beginPath();
+  ctx.arc(ox, oy, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#9ca3af';
+  ctx.font = '11px monospace';
+  ctx.fillText('LD2450 (0,0)', ox - 36, oy - 12);
+
+  // 3. Draw Impact Anchor Zones (500mm Floor Zone & 800mm Recovery Radius)
+  if (impactPoint) {
+    const { px: ix, py: iy } = mmToCanvas(impactPoint.x, impactPoint.y);
+
+    // 800mm Recovery Radius (Green dashed)
+    ctx.beginPath();
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(16, 185, 129, 0.75)';
+    ctx.lineWidth = 1.5;
+    ctx.arc(ix, iy, RECOVERY_DIST_MM * scale, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // 500mm Floor Radius (Amber filled + solid border)
+    ctx.beginPath();
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(245, 158, 11, 0.14)';
+    ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
+    ctx.arc(ix, iy, FLOOR_RADIUS_MM * scale, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Crosshair at Impact Anchor
+    ctx.strokeStyle = '#f59e0b';
+    ctx.beginPath();
+    ctx.moveTo(ix - 8, iy); ctx.lineTo(ix + 8, iy);
+    ctx.moveTo(ix, iy - 8); ctx.lineTo(ix, iy + 8);
+    ctx.stroke();
+  }
+
+  // 4. Draw Live Suspect Step Radius (600mm)
+  if (currentState === 1 && suspectTrack) {
+    const { px: sx, py: sy } = mmToCanvas(suspectTrack.x, suspectTrack.y);
+    ctx.beginPath();
+    ctx.setLineDash([2, 4]);
+    ctx.strokeStyle = 'rgba(99, 102, 241, 0.6)';
+    ctx.arc(sx, sy, MAX_STEP_MM * scale, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // 5. Draw Confirmed Fall Marker
+  if (fallPoint && currentState === 2) {
+    const { px: fx, py: fy } = mmToCanvas(fallPoint.x, fallPoint.y);
+    ctx.beginPath();
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.3)';
+    ctx.strokeStyle = '#ef4444';
+    ctx.lineWidth = 2.5;
+    ctx.arc(fx, fy, FLOOR_RADIUS_MM * scale, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px monospace';
+    ctx.fillText('! FALL CONFIRMED !', fx - 65, fy - (FLOOR_RADIUS_MM * scale) - 8);
+  }
+
+  // 6. Draw Targets and Trails
+  targets.forEach((t, i) => {
+    // Draw history trail
+    if (t.trail.length > 1) {
+      ctx.beginPath();
+      ctx.strokeStyle = TARGET_COLORS[i];
+      ctx.lineWidth = 2;
+      t.trail.forEach((pt, idx) => {
+        const { px, py } = mmToCanvas(pt.x, pt.y);
+        if (idx === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.globalAlpha = 0.4;
+      ctx.stroke();
+      ctx.globalAlpha = 1.0;
+    }
+
+    if (!t.active) return;
+    const { px, py } = mmToCanvas(t.x, t.y);
+
+    // Target glow & dot
+    ctx.beginPath();
+    ctx.fillStyle = TARGET_COLORS[i];
+    ctx.arc(px, py, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Label
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '11px monospace';
+    ctx.fillText(`T${i + 1} (${t.x},${t.y}) ${t.v}cm/s`, px + 12, py + 4);
+  });
+
+  // Update FPS counter
+  const now = performance.now();
+  if (now - lastFpsTime >= 1000) {
+    document.getElementById('fps').textContent = `${frameCounter} Hz`;
+    frameCounter = 0;
+    lastFpsTime = now;
+  }
+
+  requestAnimationFrame(drawRadar);
+}
+
+// Web Serial Connection Handler
+connectBtn.addEventListener('click', async () => {
+  if (!('serial' in navigator)) {
+    alert('Web Serial API not supported. Please open this page in Google Chrome or Microsoft Edge.');
+    return;
+  }
+
+  if (port) {
+    keepReading = false;
+    if (reader) await reader.cancel();
+    await port.close();
+    port = null;
+    connectBtn.textContent = 'Connect Serial (115200)';
+    connectBtn.classList.remove('connected');
+    appendLog('Disconnected from serial port');
+    return;
+  }
+
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    connectBtn.textContent = 'Disconnect Serial';
+    connectBtn.classList.add('connected');
+    appendLog('Connected to ESP32 @ 115200 baud', 'log-info');
+
+    keepReading = true;
+    readSerialLoop();
+  } catch (err) {
+    appendLog(`Error: ${err.message}`, 'log-alert');
+    port = null;
+  }
+});
+
+async function readSerialLoop() {
+  const textDecoder = new TextDecoderStream();
+  const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+  reader = textDecoder.readable.getReader();
+
+  let buffer = '';
+  try {
+    while (keepReading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // keep incomplete line in buffer
+      for (const line of lines) {
+        parseSerialLine(line);
+      }
+    }
+  } catch (err) {
+    appendLog(`Serial read error: ${err.message}`, 'log-alert');
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+requestAnimationFrame(drawRadar);
+</script>
+</body>
+</html>
