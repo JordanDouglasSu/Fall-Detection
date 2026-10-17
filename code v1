@@ -4,30 +4,34 @@
 #define TXD2 17
 
 // ---------- Tunable thresholds (speeds in cm/s) ----------
-#define SPEED_PEAK_CMS      45    // min speed to count as a fall burst
-#define SPEED_JUMP_CMS      25    // rise vs. slowest of last 3 frames
-#define SPEED_HIGH_CMS     100    // very fast movement triggers on its own
-#define STILL_SPEED_CMS     10    // below this = not moving
-#define MOVE_SPEED_CMS      35    // above this = person is up and moving
+#define SPEED_PEAK_CMS      65    // min speed to count as a fall burst
+#define SPEED_JUMP_CMS      40    // min speed increase between two frames
+#define STILL_SPEED_CMS     10    // below this = "not moving"
+#define MOVE_SPEED_CMS      30    // above this = person is moving again
 #define SETTLE_MS          400    // ignore data right after the burst
-#define STILL_TIME_MS     2000    // must stay still/missing this long
-#define SUSPECT_TIMEOUT_MS 12000  // give up if not confirmed in this time
-#define TRACK_RADIUS_MM    2000   // how far the person may move
-#define COOLDOWN_MS        8000
+#define STILL_TIME_MS     3000    // must stay still this long to confirm
+#define SUSPECT_TIMEOUT_MS 10000  // give up if not confirmed in this time
+#define TRACK_RADIUS_MM    2000   // how far the person may move during a fall
+#define COOLDOWN_MS       10000   // pause after an alert
 
-struct Target { int x, y, v; bool active; };
+struct Target {
+  int x, y, v;
+  bool active;
+};
 
 enum State { MONITOR, SUSPECT, COOLDOWN };
 State state = MONITOR;
 
-int hist[3][3] = {{0}};             // last 3 speeds per target
+int prevAbsV[3] = {0, 0, 0};
 unsigned long suspectStart = 0, stillSince = 0, cooldownStart = 0;
-int fx = 0, fy = 0;
+int fx = 0, fy = 0;                 // last known position of suspected faller
+
+unsigned long lastPrint = 0;
 uint32_t packetCount = 0;
 
-int decodeVal(uint8_t lo, uint8_t hi) {
+int16_t decode(uint8_t lo, uint8_t hi) {
   uint16_t raw = lo | (hi << 8);
-  int mag = raw & 0x7FFF;
+  int16_t mag = raw & 0x7FFF;
   return (raw & 0x8000) ? mag : -mag;   // bit15 = 1 -> positive
 }
 
@@ -40,13 +44,8 @@ void processFrame(Target t[3]) {
       for (int i = 0; i < 3; i++) {
         if (!t[i].active) continue;
         int absV = abs(t[i].v);
-        int minRecent = hist[i][0];
-        if (hist[i][1] < minRecent) minRecent = hist[i][1];
-        if (hist[i][2] < minRecent) minRecent = hist[i][2];
-        int jump = absV - minRecent;
-        bool burst = (absV >= SPEED_PEAK_CMS && jump >= SPEED_JUMP_CMS) ||
-                     (absV >= SPEED_HIGH_CMS);
-        if (burst) {
+        int jump = absV - prevAbsV[i];
+        if (absV >= SPEED_PEAK_CMS && jump >= SPEED_JUMP_CMS) {
           state = SUSPECT;
           suspectStart = now;
           stillSince = 0;
@@ -60,13 +59,14 @@ void processFrame(Target t[3]) {
       break;
 
     case SUSPECT: {
+      // Timeout: no confirmation, person probably just moved quickly
       if (now - suspectStart > SUSPECT_TIMEOUT_MS) {
         Serial.println(">> Cancelled: timeout");
         state = MONITOR;
         break;
       }
-      if (now - suspectStart < SETTLE_MS) break;
 
+      // Find the active target closest to the last known position
       int best = -1;
       long bestDist = (long)TRACK_RADIUS_MM * TRACK_RADIUS_MM;
       for (int i = 0; i < 3; i++) {
@@ -76,32 +76,30 @@ void processFrame(Target t[3]) {
         if (d <= bestDist) { bestDist = d; best = i; }
       }
 
-      bool still;
-      if (best < 0) {
-        still = true;                    // target vanished: treat as lying still
-      } else {
-        fx = t[best].x;
-        fy = t[best].y;
-        int absV = abs(t[best].v);
-        if (absV >= MOVE_SPEED_CMS) {
-          Serial.println(">> Cancelled: person moving normally");
-          state = MONITOR;
-          break;
-        }
-        still = (absV <= STILL_SPEED_CMS);
+      if (now - suspectStart < SETTLE_MS) break;   // let the body settle
+
+      if (best < 0) {                              // target lost
+        Serial.println(">> Cancelled: target lost");
+        state = MONITOR;
+        break;
       }
 
-      if (still) {
+      fx = t[best].x;
+      fy = t[best].y;
+      int absV = abs(t[best].v);
+
+      if (absV <= STILL_SPEED_CMS) {
         if (stillSince == 0) stillSince = now;
         if (now - stillSince >= STILL_TIME_MS) {
           Serial.println("*****************************");
           Serial.printf("***   FALL DETECTED!      *** (X:%d Y:%d mm)\n", fx, fy);
           Serial.println("*****************************");
+          // TODO: trigger buzzer / send alert here
           state = COOLDOWN;
           cooldownStart = now;
         }
-      } else {
-        stillSince = 0;
+      } else if (absV >= MOVE_SPEED_CMS) {
+        stillSince = 0;                            // moving again, restart timer
       }
       break;
     }
@@ -114,11 +112,9 @@ void processFrame(Target t[3]) {
       break;
   }
 
-  for (int i = 0; i < 3; i++) {
-    hist[i][2] = hist[i][1];
-    hist[i][1] = hist[i][0];
-    hist[i][0] = t[i].active ? abs(t[i].v) : 0;
-  }
+  // Remember speeds for the next frame's jump calculation
+  for (int i = 0; i < 3; i++)
+    prevAbsV[i] = t[i].active ? abs(t[i].v) : 0;
 }
 
 void setup() {
@@ -146,20 +142,23 @@ void loop() {
         Target t[3];
         for (int i = 0; i < 3; i++) {
           int o = 4 + i * 8;
-          t[i].x = decodeVal(buf[o],     buf[o + 1]);
-          t[i].y = decodeVal(buf[o + 2], buf[o + 3]);
-          t[i].v = decodeVal(buf[o + 4], buf[o + 5]);
+          t[i].x = decode(buf[o],     buf[o + 1]);
+          t[i].y = decode(buf[o + 2], buf[o + 3]);
+          t[i].v = decode(buf[o + 4], buf[o + 5]);
           t[i].active = !(t[i].x == 0 && t[i].y == 0);
         }
 
-        processFrame(t);
+        processFrame(t);   // run detection on EVERY frame
 
-        // Radar data line: D,x1,y1,v1,x2,y2,v2,x3,y3,v3,state
-        Serial.printf("D,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-          t[0].x, t[0].y, t[0].v,
-          t[1].x, t[1].y, t[1].v,
-          t[2].x, t[2].y, t[2].v,
-          (int)state);
+        // Throttled debug print
+        if (millis() - lastPrint >= 200) {
+          lastPrint = millis();
+          for (int i = 0; i < 3; i++) {
+            if (t[i].active)
+              Serial.printf("T%d X:%5d mm  Y:%5d mm  V:%4d cm/s\n",
+                            i + 1, t[i].x, t[i].y, t[i].v);
+          }
+        }
       }
       idx = 0;
     }
