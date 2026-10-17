@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LD2450 Radar</title>
+<style>
+:root{--bg:#eef1ec;--panel:#fbfcfa;--ink:#1d2a2a;--mute:#6b7a78;--line:#c9d2cc;--ok:#2f7d6d;--bad:#c4372c}
+*{box-sizing:border-box}
+body{margin:0;font-family:"IBM Plex Sans",system-ui,sans-serif;background:var(--bg);color:var(--ink);display:grid;grid-template-columns:1fr 300px;height:100vh}
+main{position:relative;min-width:0}
+canvas{width:100%;height:100%;display:block}
+aside{background:var(--panel);border-left:1px solid var(--line);padding:16px;display:flex;flex-direction:column;gap:14px;overflow:auto}
+h1{font-size:18px;margin:0}
+button{font:inherit;padding:9px 12px;border:1px solid var(--ink);background:var(--ink);color:#fff;border-radius:6px;cursor:pointer}
+button:focus-visible{outline:3px solid var(--ok);outline-offset:2px}
+.row{display:flex;gap:8px;align-items:center}
+#status{font-size:13px;color:var(--mute)}
+#state{padding:8px 10px;border-radius:6px;background:#e3ebe6;font-size:14px}
+#state.sus{background:#f6e3b4}#state.cool{background:#f3d1cc}
+.t{display:grid;grid-template-columns:14px 1fr;gap:2px 8px;font-size:13px;padding:8px 0;border-top:1px solid var(--line)}
+.t i{width:12px;height:12px;border-radius:50%;margin-top:3px}
+.t span{color:var(--mute)}
+#log{font:12px/1.5 ui-monospace,Menlo,monospace;color:var(--mute);height:150px;overflow:auto;white-space:pre-wrap;border-top:1px solid var(--line);padding-top:8px}
+#alert{position:absolute;left:50%;top:16px;transform:translateX(-50%);background:var(--bad);color:#fff;padding:12px 22px;border-radius:8px;font-weight:600;font-size:20px;display:none}
+#alert.on{display:block;animation:pulse .8s infinite alternate}
+@keyframes pulse{to{opacity:.55}}
+@media(max-width:800px){body{grid-template-columns:1fr;grid-template-rows:60vh auto;height:auto}}
+@media(prefers-reduced-motion:reduce){#alert.on{animation:none}}
+</style>
+</head>
+<body>
+<main><canvas id="c"></canvas><div id="alert" role="alert"></div></main>
+<aside>
+  <h1>LD2450 radar</h1>
+  <div class="row"><button id="btn">Connect ESP32</button><span id="status">Not connected</span></div>
+  <div id="state">Waiting for data</div>
+  <div id="targets"></div>
+  <div id="log"></div>
+</aside>
+<script>
+const COLORS=["#d1495b","#2a7fba","#e09f1f"];
+const cv=document.getElementById("c"),ctx=cv.getContext("2d");
+const tgt=[{},{},{}],trail=[[],[],[]];
+let alertUntil=0,lastFrame=0,frames=0;
+const $=id=>document.getElementById(id);
+
+function log(s){const l=$("log");l.textContent+=s+"\n";if(l.textContent.length>4000)l.textContent=l.textContent.slice(-3000);l.scrollTop=l.scrollHeight}
+
+function onLine(line){
+  line=line.trim();if(!line)return;
+  if(line.startsWith("D,")){
+    const p=line.split(",").map(Number);
+    if(p.length<11)return;
+    const now=performance.now();lastFrame=now;frames++;
+    for(let i=0;i<3;i++){
+      const x=p[1+i*3],y=p[2+i*3],v=p[3+i*3];
+      if(x===0&&y===0){tgt[i]={active:false};continue}
+      tgt[i]={active:true,x,y,v};
+      trail[i].push({x,y,t:now});
+    }
+    const st=p[10];
+    const s=$("state");
+    s.className=st===1?"sus":st===2?"cool":"";
+    s.textContent=["Monitoring","Suspected fall: checking","Fall alert cooldown"][st]||"Monitoring";
+    renderTable();
+    return;
+  }
+  log(line);
+  if(line.includes("FALL DETECTED")){alertUntil=performance.now()+8000;$("alert").textContent="FALL DETECTED";$("alert").classList.add("on")}
+}
+
+function renderTable(){
+  $("targets").innerHTML=tgt.map((t,i)=>`<div class="t"><i style="background:${COLORS[i]};opacity:${t.active?1:.25}"></i>`+
+   (t.active?`<div>Target ${i+1}<br><span>X ${t.x} mm, Y ${t.y} mm<br>Speed ${t.v} cm/s</span></div>`:`<div><span>Target ${i+1}: no one</span></div>`)+`</div>`).join("");
+}
+
+function draw(){
+  const dpr=devicePixelRatio||1,W=cv.clientWidth,H=cv.clientHeight;
+  if(cv.width!==W*dpr||cv.height!==H*dpr){cv.width=W*dpr;cv.height=H*dpr}
+  ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
+  const m=36,s=Math.min((W-m*2)/10.4,(H-m*2)/6.2)/1000; // px per mm
+  const cx=W/2,cy=H-m;
+  const P=(x,y)=>[cx+x*s,cy-y*s];
+  const a0=Math.PI/2-Math.PI/3,a1=Math.PI/2+Math.PI/3;
+  // detection wedge
+  ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,6000*s,-a1,-a0);ctx.closePath();
+  ctx.fillStyle="#e3ebe6";ctx.fill();ctx.strokeStyle="#a9b8b0";ctx.stroke();
+  // range rings
+  ctx.font="12px system-ui";ctx.fillStyle="#6b7a78";ctx.strokeStyle="#c3cfc8";
+  for(let r=1;r<=6;r++){
+    ctx.beginPath();ctx.arc(cx,cy,r*1000*s,-a1,-a0);ctx.stroke();
+    const [lx,ly]=P(0,r*1000);ctx.fillText(r+" m",lx+4,ly+14);
+  }
+  // 30 degree guide lines
+  for(const d of [-30,0,30]){const a=d*Math.PI/180;ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+Math.sin(a)*6000*s,cy-Math.cos(a)*6000*s);ctx.stroke()}
+  // sensor
+  ctx.fillStyle="#1d2a2a";ctx.fillRect(cx-14,cy,28,8);
+  // trails + targets
+  const now=performance.now();
+  for(let i=0;i<3;i++){
+    trail[i]=trail[i].filter(p=>now-p.t<4000);
+    ctx.strokeStyle=COLORS[i];ctx.lineWidth=2;
+    for(let k=1;k<trail[i].length;k++){
+      const a=trail[i][k-1],b=trail[i][k];
+      ctx.globalAlpha=Math.max(0,1-(now-b.t)/4000)*.7;
+      ctx.beginPath();ctx.moveTo(...P(a.x,a.y));ctx.lineTo(...P(b.x,b.y));ctx.stroke();
+    }
+    ctx.globalAlpha=1;ctx.lineWidth=1;
+    const t=tgt[i];
+    if(t&&t.active){
+      const [px,py]=P(t.x,t.y);
+      ctx.beginPath();ctx.arc(px,py,16,0,7);ctx.fillStyle=COLORS[i]+"33";ctx.fill();
+      ctx.beginPath();ctx.arc(px,py,8,0,7);ctx.fillStyle=COLORS[i];ctx.fill();
+      ctx.fillStyle="#1d2a2a";ctx.font="600 13px system-ui";
+      ctx.fillText("T"+(i+1),px+14,py-10);
+      ctx.font="12px system-ui";ctx.fillStyle="#6b7a78";
+      ctx.fillText(`${(t.x/1000).toFixed(2)}, ${(t.y/1000).toFixed(2)} m  ${t.v} cm/s`,px+14,py+5);
+    }
+  }
+  if(alertUntil&&now>alertUntil){alertUntil=0;$("alert").classList.remove("on")}
+  if(frames&&now-lastFrame>2000)$("status").textContent="Connected, no frames";
+  requestAnimationFrame(draw);
+}
+
+async function connect(){
+  if(!("serial" in navigator)){alert("Web Serial needs Chrome or Edge on desktop.");return}
+  try{
+    const port=await navigator.serial.requestPort();
+    await port.open({baudRate:115200});
+    $("status").textContent="Connected";$("btn").textContent="Connected";$("btn").disabled=true;
+    const reader=port.readable.pipeThrough(new TextDecoderStream()).getReader();
+    let buf="";
+    for(;;){
+      const {value,done}=await reader.read();if(done)break;
+      buf+=value;let i;
+      while((i=buf.indexOf("\n"))>=0){onLine(buf.slice(0,i));buf=buf.slice(i+1)}
+    }
+  }catch(e){$("status").textContent="Failed: "+e.message;$("btn").disabled=false;$("btn").textContent="Connect ESP32"}
+}
+$("btn").onclick=connect;
+renderTable();draw();
+</script>
+</body>
+</html>
