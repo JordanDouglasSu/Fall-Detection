@@ -1,0 +1,97 @@
+#include <Arduino.h>
+
+#define RX_PIN 16        // ESP32 RX2  <- module TX
+#define TX_PIN 17        // ESP32 TX2  -> module RX
+#define SHOW_MAP 1       // 1 = print 32x24 ASCII heatmap, 0 = numbers only
+
+const uint32_t BAUDS[] = {115200, 460800};
+int baudIdx = 0;
+
+uint8_t buf[1544];       // 4 header + 1536 pixels + 2 ambient + 2 checksum
+int idx = 0;
+float T[768];
+float ambient = 0;
+bool csumOk = false;
+uint32_t frames = 0, bytesSeen = 0;
+unsigned long baudStart = 0, lastPrint = 0, firstFrameMs = 0;
+
+void startUart() {
+  Serial2.end();
+  Serial2.begin(BAUDS[baudIdx], SERIAL_8N1, RX_PIN, TX_PIN);
+  idx = 0; bytesSeen = 0; baudStart = millis();
+  Serial.printf("\nListening at %lu baud...\n", (unsigned long)BAUDS[baudIdx]);
+}
+
+void handleFrame() {
+  uint16_t sum = 0;
+  for (int i = 0; i < 1542; i++) sum += buf[i];
+  uint16_t got = buf[1542] | (buf[1543] << 8);
+  csumOk = (sum == got);
+
+  for (int i = 0; i < 768; i++) {
+    int16_t raw = (int16_t)(buf[4 + i * 2] | (buf[5 + i * 2] << 8));
+    T[i] = raw / 100.0f;
+  }
+  ambient = (int16_t)(buf[1540] | (buf[1541] << 8)) / 100.0f;
+  if (frames == 0) firstFrameMs = millis();
+  frames++;
+}
+
+void printStatus() {
+  float mn = 1000, mx = -1000, sum = 0;
+  int hot = 0;
+  for (int i = 0; i < 768; i++) {
+    if (T[i] < mn) mn = T[i];
+    if (T[i] > mx) { mx = T[i]; hot = i; }
+    sum += T[i];
+  }
+  float fps = frames * 1000.0f / (millis() - firstFrameMs + 1);
+  Serial.printf("\nFrames:%lu (%.1f/s) Checksum:%s | Min %.1fC  Max %.1fC  Avg %.1fC  Ambient %.1fC | Hottest at col %d row %d\n",
+                (unsigned long)frames, fps, csumOk ? "OK" : "MISMATCH",
+                mn, mx, sum / 768.0f, ambient, hot % 32, hot / 32);
+#if SHOW_MAP
+  const char* ramp = " .:-=+*#%@";
+  for (int r = 0; r < 24; r++) {
+    for (int c = 0; c < 32; c++) {
+      int lv = (int)((T[r * 32 + c] - mn) / (mx - mn + 0.01f) * 9);
+      Serial.print(ramp[lv < 0 ? 0 : (lv > 9 ? 9 : lv)]);
+    }
+    Serial.println();
+  }
+#endif
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n--- GY-MCU90640 serial test ---");
+  startUart();
+}
+
+void loop() {
+  while (Serial2.available()) {
+    uint8_t b = Serial2.read();
+    bytesSeen++;
+    if (idx == 0) { if (b == 0x5A) buf[idx++] = b; continue; }
+    if (idx == 1) { if (b == 0x5A) buf[idx++] = b; else idx = 0; continue; }
+    buf[idx++] = b;
+    if (idx == 4 && !(buf[2] == 0x02 && buf[3] == 0x06)) { idx = 0; continue; }
+    if (idx == 1544) { handleFrame(); idx = 0; }
+  }
+
+  // No frames yet: report and try the other baud rate
+  if (frames == 0 && millis() - baudStart > 4000) {
+    Serial.printf("No valid frame. Bytes received: %lu\n", (unsigned long)bytesSeen);
+    if (bytesSeen == 0)
+      Serial.println("  -> Nothing received at all: check TX/RX wiring (crossed?), GND and power.");
+    else
+      Serial.println("  -> Data arrives but isn't a valid frame: wrong baud rate or PS mode.");
+    baudIdx = (baudIdx + 1) % 2;
+    startUart();
+  }
+
+  if (frames > 0 && millis() - lastPrint >= 1000) {
+    lastPrint = millis();
+    printStatus();
+  }
+}
