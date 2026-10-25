@@ -15,4 +15,8 @@ Ignore the comments above. We using rasberry pi and MLX 90640 IR Camera
 <img width="881" height="501" alt="image" src="https://github.com/user-attachments/assets/3afbc4ba-57e9-4b49-8b1a-c9013a316fa6" />
 
 Pin Connections 
+<br>//For I2C
 <br> <img width="850" height="341" alt="image" src="https://github.com/user-attachments/assets/6c551024-94ad-4274-bc25-efee55799228" />
+<br> //For UART
+<br> <img width="912" height="505" alt="image" src="https://github.com/user-attachments/assets/dd5368a1-e16f-48f6-8b94-c9c9134a270f" />
+
