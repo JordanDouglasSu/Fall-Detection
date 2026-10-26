@@ -1,0 +1,441 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HardwareSerial.h>
+
+// ========================== HARDWARE & PINS ==========================
+#define RXD2 16               // ESP32 RX2 <- GY-MCU90640 TX
+#define TXD2 17               // ESP32 TX2 -> GY-MCU90640 RX
+#define ALERT_LED_PIN 2       // Onboard ESP32 LED indicator
+
+HardwareSerial SensorSerial(2);
+WebServer server(80);
+
+const uint32_t BAUDS[2] = {115200, 460800};
+int baudIdx = 0;
+unsigned long baudStart = 0;
+
+// ========================== TUNING ==================================
+#define BODY_DELTA_C       1.5f   // Pixel must be this much above median background
+#define MIN_BODY_PIXELS    6      // Minimum warm pixels to count as a person
+
+// Trigger into POTENTIAL_FALL (midway between Standing/Sitting and Floor)
+#define DROP_TRIGGER       3.0f   // Sudden centroid drop (rows) = possible fall
+#define AR_TRIGGER         2.60f  // Above Sitting (2.38), well below Lying (5.25)
+#define ROW_TRIGGER        12.0f  // Above Standing (8.7), well below Lying (14.9)
+
+// Confirm Floor Posture (requires ALL 3: AR >= 2.80, Cy >= 12.0, Ymax >= 15)
+#define AR_FALL            2.80f  // Confirmed horizontal body aspect ratio
+#define ROW_FLOOR          12.0f  // Confirmed floor centroid row (Standing=8.7, Fall=14.9)
+#define BOTTOM_ROW_FLOOR   15     // Gives Ymax=17 a 2-pixel buffer; blocks Sitting (Ymax=7)
+
+// Recovery / Standing Clear (Standing AR=0.88, Cy=8.7)
+#define AR_UPRIGHT         1.35f  // Safely above Standing AR (0.88) so recovery always works
+#define ROW_UPRIGHT        11.0f  // Safely above Standing Cy (8.7)
+
+// Timers
+#define CONFIRM_MS         3500   // Must stay horizontal on floor 3.5s to confirm
+#define SUSPECT_TIMEOUT_MS 10000  // Cancel unconfirmed suspicion after 10s
+#define ALERT_HOLD_MS      60000  // Re-evaluate a latched alert after 60s
+#define STRICT_CHECKSUM    0      // Set to 1 if badCsum stays 0 in Serial Monitor
+
+// ======================= BUFFERS & STATE ============================
+const uint16_t FRAME_PIXELS = 768;  // 32x24
+const uint16_t FRAME_LEN    = 1544; // 4 header + 1536 pixels + 2 ambient + 2 checksum
+
+uint8_t rxBuffer[FRAME_LEN];
+uint16_t bIndex = 0;
+
+// Static/Global buffers prevent 8KB ESP32 loopTask stack overflow
+float thermalFrame[FRAME_PIXELS];
+float tmpFrame[FRAME_PIXELS];
+float sortedFrame[FRAME_PIXELS];
+
+float ambientTemp = 25.0f, background = 25.0f;
+float minTemp = 20.0f, maxTemp = 35.0f;
+
+uint32_t frameCount = 0, badChecksum = 0;
+unsigned long lastFrameMs = 0;
+
+int bbox_x1 = -1, bbox_y1 = -1, bbox_x2 = -1, bbox_y2 = -1;
+float centroidY = 0.0f, prevCentroidY = -1.0f, aspectRatio = 0.0f;
+bool fallDetected = false;
+unsigned long stateStart = 0;
+unsigned long horizontalStart = 0;
+
+enum FallState { STANDING, POTENTIAL_FALL, FALL_ALERT };
+FallState systemState = STANDING;
+
+// =================== EMBEDDED WEB DASHBOARD =========================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Thermal Fall Detection</title>
+  <style>
+    :root { --bg:#111; --card:#1c1c1e; --ok:#00e676; --warn:#ffb300; --alert:#ff1744; }
+    body { margin:0; padding:16px; background:var(--bg); color:#f0f0f5; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif; display:flex; flex-direction:column; align-items:center; }
+    .panel { background:var(--card); border:1px solid #333; border-radius:12px; padding:20px; width:100%; max-width:460px; box-sizing:border-box; box-shadow:0 8px 24px rgba(0,0,0,0.5); }
+    .header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+    .badge { width:100%; padding:10px 0; border-radius:6px; text-align:center; font-weight:700; margin-bottom:14px; letter-spacing:0.04em; }
+    .status-ok { background:rgba(0,230,118,0.15); color:var(--ok); border:1px solid var(--ok); }
+    .status-warn { background:rgba(255,179,0,0.2); color:var(--warn); border:1px solid var(--warn); }
+    .status-alert { background:rgba(255,23,68,0.25); color:var(--alert); border:1px solid var(--alert); animation:blink 0.7s infinite alternate; }
+    @keyframes blink { from { opacity:0.6; } to { opacity:1; } }
+    .canvas-box { background:#000; border-radius:8px; overflow:hidden; border:1px solid #444; }
+    canvas { width:100%; height:auto; aspect-ratio:4/3; display:block; }
+    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-top:14px; text-align:center; }
+    .stat-item { background:#0a0a0c; padding:8px 4px; border-radius:6px; border:1px solid #2a2a2a; }
+    .stat-lbl { font-size:10px; color:#888; text-transform:uppercase; }
+    .stat-val { font-size:14px; font-weight:700; margin-top:3px; }
+    button { margin-top:14px; width:100%; padding:10px; border-radius:6px; border:1px solid #555; background:#2a2a2e; color:#fff; font-size:14px; cursor:pointer; }
+    button:active { background:#3a3a3e; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div class="header">
+      <h3 style="margin:0;">Thermal Fall Guard</h3>
+      <label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="smoothToggle" checked> Smooth</label>
+    </div>
+    <div id="statusBadge" class="badge status-ok">CONNECTING...</div>
+    <div class="canvas-box"><canvas id="viewCanvas" width="320" height="240"></canvas></div>
+    <div class="stats">
+      <div class="stat-item"><div class="stat-lbl">Aspect</div><div class="stat-val" id="arVal">0.00</div></div>
+      <div class="stat-item"><div class="stat-lbl">Row (Cy)</div><div class="stat-val" id="rowVal">0.0</div></div>
+      <div class="stat-item"><div class="stat-lbl">Peak</div><div class="stat-val" id="peakVal">--</div></div>
+      <div class="stat-item"><div class="stat-lbl">Median</div><div class="stat-val" id="ambVal">--</div></div>
+    </div>
+    <button onclick="fetch('/reset')">Clear Alert</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('viewCanvas');
+    const ctx = canvas.getContext('2d');
+    const off = document.createElement('canvas');
+    off.width = 32; off.height = 24;
+    const offCtx = off.getContext('2d');
+
+    function colormap(t, mn, mx) {
+      const n = Math.max(0, Math.min(1, (t - mn) / (mx - mn || 1)));
+      return [Math.floor(255*Math.sqrt(n)), Math.floor(255*Math.pow(n,3)), Math.floor(255*Math.sin(n*Math.PI))];
+    }
+
+    async function loop() {
+      try {
+        const d = await (await fetch('/data', { cache:'no-store' })).json();
+        const img = offCtx.createImageData(32, 24);
+        for (let i = 0; i < 768; i++) {
+          const [r,g,b] = colormap(d.pixels[i], d.min, d.max);
+          img.data[i*4]=r; img.data[i*4+1]=g; img.data[i*4+2]=b; img.data[i*4+3]=255;
+        }
+        offCtx.putImageData(img, 0, 0);
+        ctx.imageSmoothingEnabled = document.getElementById('smoothToggle').checked;
+        ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+
+        // Draw bounding box even if target is 1 pixel wide
+        if (d.box[0] >= 0 && d.box[2] >= d.box[0]) {
+          const sx = canvas.width/32, sy = canvas.height/24;
+          ctx.strokeStyle = d.fall ? '#ff1744' : (d.state === 1 ? '#ffb300' : '#00e676');
+          ctx.lineWidth = 2;
+          ctx.strokeRect(d.box[0]*sx, d.box[1]*sy, (d.box[2]-d.box[0]+1)*sx, (d.box[3]-d.box[1]+1)*sy);
+        }
+
+        document.getElementById('arVal').innerText = d.ar.toFixed(2);
+        document.getElementById('rowVal').innerText = d.cy.toFixed(1);
+        document.getElementById('peakVal').innerText = d.max.toFixed(1) + '\u00B0C';
+        document.getElementById('ambVal').innerText = d.bg.toFixed(1) + '\u00B0C';
+
+        const badge = document.getElementById('statusBadge');
+        if (d.age > 3000) { badge.innerText = 'NO SENSOR DATA'; badge.className = 'badge status-alert'; }
+        else if (d.fall)  { badge.innerText = 'WARNING: FALL CONFIRMED!'; badge.className = 'badge status-alert'; }
+        else if (d.state === 1) { badge.innerText = 'VERIFYING POSSIBLE FALL...'; badge.className = 'badge status-warn'; }
+        else { badge.innerText = 'STATUS: NORMAL'; badge.className = 'badge status-ok'; }
+      } catch (e) {}
+      setTimeout(loop, 150);
+    }
+    loop();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ======================== WEB SERVER HANDLERS =======================
+void setAlert(bool on) {
+  fallDetected = on;
+  digitalWrite(ALERT_LED_PIN, on ? HIGH : LOW);
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleReset() {
+  systemState = STANDING;
+  horizontalStart = 0;
+  setAlert(false);
+  prevCentroidY = -1.0f;
+  server.send(200, "text/plain", "ok");
+}
+
+void handleData() {
+  unsigned long age = frameCount ? (millis() - lastFrameMs) : 99999;
+  String json;
+  json.reserve(3900);
+  json += "{\"min\":";  json += String(minTemp, 1);
+  json += ",\"max\":";  json += String(maxTemp, 1);
+  json += ",\"bg\":";   json += String(background, 1);
+  json += ",\"ar\":";   json += String(aspectRatio, 2);
+  json += ",\"cy\":";   json += String(centroidY, 1);
+  json += ",\"fall\":"; json += (fallDetected ? "true" : "false");
+  json += ",\"state\":"; json += String((int)systemState);
+  json += ",\"age\":";  json += String(age);
+  json += ",\"box\":[" + String(bbox_x1) + "," + String(bbox_y1) + "," + String(bbox_x2) + "," + String(bbox_y2);
+  json += "],\"pixels\":[";
+  for (int i = 0; i < FRAME_PIXELS; i++) {
+    json += String(thermalFrame[i], 1);
+    if (i < FRAME_PIXELS - 1) json += ",";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
+}
+
+// ===================== FALL DETECTION ALGORITHM =====================
+int cmpFloat(const void* a, const void* b) {
+  float fa = *(const float*)a, fb = *(const float*)b;
+  return (fa > fb) - (fa < fb);
+}
+
+void analyzeFrame() {
+  // 1. Background = median of the 768 pixels (immune to self-heating chip temp)
+  memcpy(sortedFrame, thermalFrame, sizeof(sortedFrame));
+  qsort(sortedFrame, FRAME_PIXELS, sizeof(float), cmpFloat);
+  background = sortedFrame[FRAME_PIXELS / 2];
+  float threshold = background + BODY_DELTA_C;
+
+  int minX = 32, maxX = -1, minY = 24, maxY = -1, count = 0;
+  float sumY = 0;
+
+  for (int y = 0; y < 24; y++) {
+    for (int x = 0; x < 32; x++) {
+      if (thermalFrame[y * 32 + x] > threshold) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        sumY += y;
+        count++;
+      }
+    }
+  }
+
+  unsigned long now = millis();
+
+  // 2. Nobody visible in frame
+  if (count < MIN_BODY_PIXELS) {
+    bbox_x1 = bbox_y1 = bbox_x2 = bbox_y2 = -1;
+    aspectRatio = 0.0f;
+    centroidY = 0.0f;
+    prevCentroidY = -1.0f;
+    horizontalStart = 0;
+
+    if (systemState == POTENTIAL_FALL) {
+      systemState = STANDING;
+    }
+    // Keep FALL_ALERT latched until timeout in case fallen person rolls out of view
+    if (systemState == FALL_ALERT && (now - stateStart > ALERT_HOLD_MS)) {
+      systemState = STANDING;
+      setAlert(false);
+    }
+    return;
+  }
+
+  // 3. Compute Bounding Box & Centroid
+  bbox_x1 = minX; bbox_x2 = maxX;
+  bbox_y1 = minY; bbox_y2 = maxY;
+  aspectRatio = (float)(maxX - minX + 1) / (float)(maxY - minY + 1);
+  centroidY = sumY / (float)count;
+
+  float drop = (prevCentroidY < 0.0f) ? 0.0f : (centroidY - prevCentroidY);
+  prevCentroidY = centroidY;
+
+  // Floor posture requires horizontal aspect ratio, low centroid, and bottom edge near floor
+  bool horizontalOnFloor = (aspectRatio >= AR_FALL) &&
+                           (centroidY >= ROW_FLOOR) &&
+                           (maxY >= BOTTOM_ROW_FLOOR);
+
+  // 4. State Machine
+  switch (systemState) {
+    case STANDING:
+      if (drop >= DROP_TRIGGER || (aspectRatio >= AR_TRIGGER && centroidY >= ROW_TRIGGER)) {
+        systemState = POTENTIAL_FALL;
+        stateStart = now;
+        horizontalStart = horizontalOnFloor ? now : 0;
+        Serial.printf(">> [SUSPECT] Possible fall (AR=%.2f, Cy=%.1f, Ymax=%d, drop=%.1f)\n",
+                      aspectRatio, centroidY, maxY, drop);
+      }
+      break;
+
+   case POTENTIAL_FALL:
+      if (horizontalOnFloor) {
+        if (horizontalStart == 0) {
+          horizontalStart = now; // Start timing continuous floor posture
+        }
+        if (now - horizontalStart >= CONFIRM_MS) {
+          systemState = FALL_ALERT;
+          stateStart = now;
+          setAlert(true);
+          Serial.printf("*** FALL CONFIRMED (AR=%.2f, Cy=%.1f, Ymax=%d) ***\n",
+                        aspectRatio, centroidY, maxY);
+        }
+      } else {
+        // Reset continuous floor timer if posture leaves floor envelope
+        horizontalStart = 0;
+
+        if (aspectRatio < AR_UPRIGHT && centroidY < ROW_UPRIGHT) {
+          systemState = STANDING;
+          Serial.println(">> [RECOVERED] Cancelled: person upright");
+        } else if (now - stateStart >= SUSPECT_TIMEOUT_MS) {
+          systemState = STANDING;
+          Serial.println(">> [CANCELLED] Suspect timeout expired");
+        }
+      }
+      break;
+
+    case FALL_ALERT:
+      if (aspectRatio < AR_UPRIGHT && centroidY < ROW_UPRIGHT) {
+        systemState = STANDING;
+        horizontalStart = 0;
+        setAlert(false);
+        Serial.println(">> [CLEARED] Person stood up, alert cleared");
+      } else if (now - stateStart >= ALERT_HOLD_MS) {
+        systemState = STANDING;
+        horizontalStart = 0;
+        setAlert(false);
+      }
+      break;
+  }
+}
+
+// ====================== PACKET PROCESSING ===========================
+void processPacket() {
+  // 16-bit Little-Endian word sum of the first 1542 bytes (771 words)
+  uint16_t sum = 0;
+  for (uint16_t i = 0; i < FRAME_LEN - 2; i += 2) {
+    sum += (uint16_t)(rxBuffer[i] | (rxBuffer[i + 1] << 8));
+  }
+  uint16_t got = (uint16_t)(rxBuffer[FRAME_LEN - 2] | (rxBuffer[FRAME_LEN - 1] << 8));
+
+  if (sum != got) {
+    badChecksum++;
+#if STRICT_CHECKSUM
+    return;
+#endif
+  }
+
+  // Unpack 768 pixels: Little-Endian int16 / 100, starting at byte 4
+  float mn = 1000.0f, mx = -1000.0f;
+  for (int i = 0; i < FRAME_PIXELS; i++) {
+    int16_t raw = (int16_t)(rxBuffer[4 + i * 2] | (rxBuffer[5 + i * 2] << 8));
+    float t = raw / 100.0f;
+    if (t < -20.0f || t > 150.0f) return; // Reject corrupted frame
+    tmpFrame[i] = t;
+    if (t < mn) mn = t;
+    if (t > mx) mx = t;
+  }
+
+  memcpy(thermalFrame, tmpFrame, sizeof(tmpFrame));
+  minTemp = mn;
+  maxTemp = mx;
+  ambientTemp = (int16_t)(rxBuffer[1540] | (rxBuffer[1541] << 8)) / 100.0f;
+
+  frameCount++;
+  lastFrameMs = millis();
+  analyzeFrame();
+}
+
+// ============================== SETUP ===============================
+void startSensorUart() {
+  SensorSerial.end();
+  SensorSerial.setRxBufferSize(2048);
+  SensorSerial.begin(BAUDS[baudIdx], SERIAL_8N1, RXD2, TXD2);
+  bIndex = 0;
+  baudStart = millis();
+
+  // Command GY-MCU90640 to enable continuous auto-frame output
+  const uint8_t autoCmd[] = {0xA5, 0x35, 0x02, 0xDC};
+  SensorSerial.write(autoCmd, sizeof(autoCmd));
+
+  Serial.printf("Sensor UART started at %lu baud\n", (unsigned long)BAUDS[baudIdx]);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ALERT_LED_PIN, OUTPUT);
+  digitalWrite(ALERT_LED_PIN, LOW);
+
+  WiFi.softAP("ESP32-Thermal-Fall", "12345678");
+  Serial.print("\nAP online. Dashboard: http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/reset", handleReset);
+  server.begin();
+
+  startSensorUart();
+}
+
+// ============================== LOOP ================================
+void loop() {
+  server.handleClient();
+
+  while (SensorSerial.available()) {
+    uint8_t b = SensorSerial.read();
+
+    if (bIndex == 0) {
+      if (b == 0x5A) rxBuffer[bIndex++] = b;
+      continue;
+    }
+    if (bIndex == 1) {
+      if (b == 0x5A) rxBuffer[bIndex++] = b;
+      else bIndex = 0;
+      continue;
+    }
+    if (bIndex == 2) {
+      if (b == 0x02) rxBuffer[bIndex++] = b;
+      else if (b == 0x5A) bIndex = 2; // Stay synced if previous checksum ended with 0x5A
+      else bIndex = 0;
+      continue;
+    }
+    if (bIndex == 3) {
+      if (b == 0x06) rxBuffer[bIndex++] = b;
+      else bIndex = 0;
+      continue;
+    }
+
+    rxBuffer[bIndex++] = b;
+    if (bIndex >= FRAME_LEN) {
+      processPacket();
+      bIndex = 0;
+    }
+  }
+
+  // No frame yet: alternate between 115200 and 460800 baud every 5 seconds
+  if (frameCount == 0 && (millis() - baudStart > 5000)) {
+    Serial.println("No frames received yet, switching baud rate...");
+    baudIdx ^= 1;
+    startSensorUart();
+  }
+
+  // 1 Hz status line
+  static unsigned long lastLog = 0;
+  if (millis() - lastLog >= 1000) {
+    lastLog = millis();
+    Serial.printf("frames:%lu badCsum:%lu | max:%.1f bg:%.1f | AR:%.2f Cy:%.1f Ymax:%d | state:%d\n",
+                  (unsigned long)frameCount, (unsigned long)badChecksum,
+                  maxTemp, background, aspectRatio, centroidY, bbox_y2, (int)systemState);
+  }
+}
