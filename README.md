@@ -19,3 +19,6 @@ Pin Connections
 <br> //For UART
 <br> <img width="912" height="505" alt="image" src="https://github.com/user-attachments/assets/dd5368a1-e16f-48f6-8b94-c9c9134a270f" />
 
+<br> Connect Wifi: ESP32-Thermal-Fall
+<br> Password: 12345678
+<br> Website: http://192.168.4.1/
