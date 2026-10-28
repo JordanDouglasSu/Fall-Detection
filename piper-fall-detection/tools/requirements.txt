@@ -1,4 +1,0 @@
-# record.py and evaluate.py need only the standard library (+ a C++ compiler for evaluate)
-paho-mqtt>=2.0     # fall_monitor.py, virtual_fall_node.py
-numpy>=1.24        # synth.py
-matplotlib>=3.7    # plot_session.py
