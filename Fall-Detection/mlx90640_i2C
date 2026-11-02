@@ -1,0 +1,153 @@
+#include <Wire.h>
+#include <Adafruit_MLX90640.h>
+
+Adafruit_MLX90640 mlx;
+
+// Thermal frame buffer: 32 columns x 24 rows = 768 pixels
+float frame[32 * 24];
+
+#define COLS 32
+#define ROWS 24
+
+// ---------- Fall Detection Thresholds ----------
+#define TEMP_OFFSET_ABOVE_AMB 2.5   // Threshold: ambient + 2.5°C = body heat
+#define ASPECT_RATIO_FALL     1.15  // Width / Height > 1.15 means horizontal body
+#define FLOOR_ROW_THRESHOLD   14    // Row 14 or higher (0=top, 23=floor)
+#define STILL_TIME_MS         4000  // Immobility duration to confirm fall (4s)
+
+// State Tracking
+enum State { MONITOR, SUSPECT, FALL_CONFIRMED, COOLDOWN };
+State state = MONITOR;
+
+unsigned long stillStart = 0;
+unsigned long alertStart = 0;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+
+  Serial.println("\n--- ESP32 + MLX90640 Thermal Fall Detector ---");
+
+  // Initialize I2C at 400 kHz (Fast Mode)
+  Wire.begin(21, 22);
+  Wire.setClock(400000);
+
+  if (!mlx.begin(MLX90640_I2CADDR_DEFAULT, &Wire)) {
+    Serial.println("ERROR: MLX90640 not detected on I2C bus! Check wiring.");
+    while (1) delay(100);
+  }
+
+  Serial.println("MLX90640 detected successfully!");
+
+  // Set mode and 4 Hz refresh rate (stable for ESP32)
+  mlx.setMode(MLX90640_CHESS);
+  mlx.setResolution(MLX90640_ADC_18BIT);
+  mlx.setRefreshRate(MLX90640_4_HZ);
+
+  pinMode(2, OUTPUT); // Onboard Blue LED for alert indicator
+  digitalWrite(2, LOW);
+}
+
+void loop() {
+  // Read 768 temperature values
+  if (mlx.getFrame(frame) != 0) {
+    return; // Frame read failed/skipped, retry next loop
+  }
+
+  // 1. Calculate Ambient (approximate via median or average of cooler pixels)
+  float minTemp = 100.0, maxTemp = -100.0, sumTemp = 0.0;
+  for (int i = 0; i < 768; i++) {
+    float val = frame[i];
+    if (val < minTemp) minTemp = val;
+    if (val > maxTemp) maxTemp = val;
+    sumTemp += val;
+  }
+  float avgTemp = sumTemp / 768.0;
+  float bodyThreshold = avgTemp + TEMP_OFFSET_ABOVE_AMB;
+
+  // 2. Find Bounding Box and Centroid of the human heat blob
+  int minX = COLS, maxX = -1;
+  int minY = ROWS, maxY = -1;
+  long sumX = 0, sumY = 0;
+  int warmPixels = 0;
+
+  for (int r = 0; r < ROWS; r++) {
+    for (int c = 0; c < COLS; c++) {
+      float temp = frame[r * COLS + c];
+      if (temp >= bodyThreshold) {
+        warmPixels++;
+        sumX += c;
+        sumY += r;
+        if (c < minX) minX = c;
+        if (c > maxX) maxX = c;
+        if (r < minY) minY = r;
+        if (r > maxY) maxY = r;
+      }
+    }
+  }
+
+  bool humanDetected = (warmPixels >= 10); // Ignore tiny isolated noise
+  bool isFallenPosture = false;
+  float aspectRatio = 0.0;
+  float centroidY = 0.0;
+
+  if (humanDetected) {
+    int blobW = (maxX - minX) + 1;
+    int blobH = (maxY - minY) + 1;
+    aspectRatio = (float)blobW / (float)blobH;
+    centroidY = (float)sumY / (float)warmPixels;
+
+    // Fall condition: Wide aspect ratio (horizontal) AND centroid in lower frame
+    if (aspectRatio >= ASPECT_RATIO_FALL && centroidY >= FLOOR_ROW_THRESHOLD) {
+      isFallenPosture = true;
+    }
+  }
+
+  // 3. Fall Verification State Machine
+  unsigned long now = millis();
+
+  switch (state) {
+    case MONITOR:
+      if (isFallenPosture) {
+        state = SUSPECT;
+        stillStart = now;
+        Serial.printf(">> [SUSPECT] Horizontal posture (AR=%.2f, Row=%.1f). Verifying...\n",
+                      aspectRatio, centroidY);
+      }
+      break;
+
+    case SUSPECT:
+      if (!isFallenPosture) {
+        Serial.println(">> Target stood back up or recovered. Alarm cleared.");
+        state = MONITOR;
+      } else if (now - stillStart >= STILL_TIME_MS) {
+        state = FALL_CONFIRMED;
+        alertStart = now;
+        digitalWrite(2, HIGH); // Turn LED ON
+        Serial.println("\n*******************************************************");
+        Serial.println("🚨🚨 EMERGENCY ALERT: FALL CONFIRMED ON FLOOR! 🚨🚨");
+        Serial.printf("Details -> Aspect Ratio: %.2f | Centroid Row: %.1f\n", aspectRatio, centroidY);
+        Serial.println("*******************************************************\n");
+      }
+      break;
+
+    case FALL_CONFIRMED:
+      if (now - alertStart >= 10000) { // 10s alert cooldown
+        digitalWrite(2, LOW);
+        state = MONITOR;
+      }
+      break;
+  }
+
+  // Periodic telemetry readout
+  static unsigned long lastPrint = 0;
+  if (now - lastPrint >= 500) {
+    lastPrint = now;
+    if (humanDetected) {
+      Serial.printf("Temp: Max=%.1fC Avg=%.1fC | Box: %dx%d (AR=%.2f) | Centroid Y: %.1f | State: %d\n",
+                    maxTemp, avgTemp, (maxX - minX + 1), (maxY - minY + 1), aspectRatio, centroidY, state);
+    } else {
+      Serial.printf("Temp: Max=%.1fC Avg=%.1fC | No human body in range.\n", maxTemp, avgTemp);
+    }
+  }
+}
