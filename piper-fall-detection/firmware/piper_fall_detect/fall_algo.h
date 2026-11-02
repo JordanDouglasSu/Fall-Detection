@@ -93,9 +93,9 @@ struct Config {
   float    uprightRatio    = 1.20f;   // body height / width at or above this = upright
 
   // Descent (wall mount): top of body drops fast while feet stay put
-  uint32_t descentWindowMs = 1000;    // drop must happen within this time (falls take < ~1 s)
-  float    descentMinRows  = 3.0f;    // top of body must drop at least this many rows
-  float    descentMinFrac  = 0.40f;   // ... and at least this fraction of body height
+  uint32_t descentWindowMs = 1500;    // drop must happen within this time (falls take < ~1.5 s)
+  float    descentMinRows  = 2.0f;    // top of body must drop at least 2 rows
+  float    descentMinFrac  = 0.30f;   // ... and at least 30% of body
   float    descentShrink   = 0.75f;   // body height must shrink to <= this ratio
   float    bottomRiseMax   = 2.0f;    // bottom edge may rise at most this (walking away raises it)
 
@@ -112,10 +112,10 @@ struct Config {
   // Timers (ms)
   uint32_t postureHoldMs   = 400;     // a new posture must persist this long
   uint32_t impactWindowMs  = 3000;    // after a descent, must reach the floor within this
-  uint32_t stillConfirmMs  = 6000;    // on floor after descent + still this long -> FALL
-  uint32_t floorConfirmMs  = 15000;   // on floor after descent this long (moving or not) -> FALL
+  uint32_t stillConfirmMs  = 2000;    // on floor after descent + still this long -> FALL
+  uint32_t floorConfirmMs  = 6000;   // on floor after descent this long (moving or not) -> FALL
   uint32_t longLieMs       = 30000;   // on floor + still this long, no descent needed -> FALL
-  uint32_t floorMaxMs      = 120000;  // on floor this long, moving or not -> FALL (0 = off)
+  uint32_t floorMaxMs      = 30000;  // on floor for 30s, moving or not -> FALL (0 = off)
   uint32_t recoverMs       = 3000;    // upright this long -> recovered
   uint32_t missingMs       = 2000;    // blob gone this long -> person gone
   uint32_t lostConfirmMs   = 10000;   // gone this long after landing on floor -> FALL
